@@ -46,7 +46,23 @@ parser.add_argument('--lambda_loss', type=float, default='0.01',
 parser.add_argument('--SCsize', type=int, default=32,
                     choices=[10, 16, 32, 64],
                     help='SC size')
+parser.add_argument('--smoke-test', action='store_true',
+                    help='run exactly one training batch without saving checkpoints')
+parser.add_argument('--smoke-batch-size', type=int, default=1,
+                    help='batch size used only with --smoke-test')
 args = parser.parse_args()
+if args.smoke_test:
+    if args.smoke_batch_size <= 0:
+        parser.error('--smoke-batch-size must be positive')
+    args.training = True
+    args.model = 'WITT_W/O'
+    args.channel_type = 'awgn'
+    args.C = 4
+    args.SCsize = 32
+    args.distortion_metric = 'MSE'
+    args.multiple_snr = '10'
+    args.lambda_loss = 0.01
+    args.num_workers = 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def conv_relu(in_channels, out_channels, kernel, stride=1, padding=0):
@@ -201,7 +217,7 @@ class config():
         train_data_dir = "./media/Dataset/CIFAR10/"
         test_data_dir = "./media/Dataset/CIFAR10/"
         # batch_size = 128 
-        batch_size = 12
+        batch_size = args.smoke_batch_size if args.smoke_test else 12
         downsample = 4
         encoder_kwargs = dict(
             img_size=(image_dims[1], image_dims[2]), patch_size=2, in_chans=3,
@@ -228,6 +244,164 @@ def load_weights(model_path):
 def downsampling(input, out_size):
     downsampled_data = torch.nn.functional.interpolate(input,size=(out_size, out_size),mode='bilinear')
     return downsampled_data
+
+
+def run_smoke_test(args, H_fading_all):
+    """Run one real training batch while leaving the full-training path untouched."""
+    net.train()
+    classifier.train()
+    smoke = {'stage': 'setup'}
+    hooks = []
+
+    def encoder_pre_hook(module, inputs):
+        smoke['stage'] = 'encoder forward'
+
+    def encoder_hook(module, inputs, output):
+        latent, mu, std = output
+        smoke['latent_shape'] = tuple(latent.shape)
+        smoke['mu_shape'] = tuple(mu.shape)
+        smoke['std_shape'] = tuple(std.shape)
+        smoke['stage'] = 'proposed loss calculation'
+
+    def channel_pre_hook(module, inputs):
+        smoke['stage'] = 'AWGN channel'
+
+    def channel_hook(module, inputs, output):
+        smoke['channel_output_shape'] = tuple(output.shape)
+
+    def decoder_pre_hook(module, inputs):
+        smoke['channel_output_shape'] = tuple(inputs[0].shape)
+        smoke['stage'] = 'decoder forward'
+
+    def decoder_hook(module, inputs, output):
+        smoke['decoder_output_shape'] = tuple(output.shape)
+        smoke['stage'] = 'distortion loss'
+
+    hooks.append(net.encoder.register_forward_pre_hook(encoder_pre_hook))
+    hooks.append(net.encoder.register_forward_hook(encoder_hook))
+    hooks.append(net.channel.register_forward_pre_hook(channel_pre_hook))
+    hooks.append(net.channel.register_forward_hook(channel_hook))
+    hooks.append(net.decoder.register_forward_pre_hook(decoder_pre_hook))
+    hooks.append(net.decoder.register_forward_hook(decoder_hook))
+
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    start_time = time.perf_counter()
+
+    try:
+        smoke['stage'] = 'data loading'
+        input_image, label = next(iter(train_loader))
+        input_image = input_image.to(device)
+        label = label.to(device)
+        smoke['input_shape'] = tuple(input_image.shape)
+
+        smoke['stage'] = 'codeword search'
+        code_assist = input_image.clone()
+        code_index = []
+        for image_ID in range(input_image.size()[0]):
+            code_index_local = 0
+            mse_ini = 10 ** 8
+            for assist_ID in range(codebook.size()[0]):
+                mse_local = MSE_loss(input_image[image_ID], codebook[assist_ID])
+                if mse_local < mse_ini:
+                    code_assist[image_ID] = codebook[assist_ID].clone()
+                    code_index_local = assist_ID
+                    mse_ini = mse_local
+            code_index.append(code_index_local)
+        code_index = torch.from_numpy(np.array(code_index)).to(device)
+        smoke['selected_codeword_shape'] = tuple(code_assist.shape)
+        smoke['selected_codeword_index'] = code_index.detach().cpu().tolist()
+
+        smoke['stage'] = 'residual calculation'
+        residual = torch.sub(input_image, code_assist)
+        smoke['residual_shape'] = tuple(residual.shape)
+        del residual
+
+        H_fading = H_fading_all[0]
+        recon_image, CBR, actual_snr, mse, loss_G, loss_P = net(
+            input_image, code_assist, code_index, H_fading)
+        smoke['reconstruction_shape'] = tuple(recon_image.shape)
+
+        # Preserve the classifier forward performed by the normal training path.
+        smoke['stage'] = 'classifier forward'
+        downsampled_image = downsampling(recon_image, 96)
+        out_class = classifier(downsampled_image)
+        loss_C = CE_loss(out_class, label)
+
+        smoke['stage'] = 'total loss'
+        loss = (loss_G + args.lambda_loss * loss_P).clone()
+        smoke['losses_finite'] = bool(
+            torch.isfinite(loss_G).all().item()
+            and torch.isfinite(loss_P).all().item()
+            and torch.isfinite(loss).all().item()
+            and torch.isfinite(loss_C).all().item())
+
+        smoke['stage'] = 'backward'
+        optimizer.zero_grad()
+        loss.backward()
+        smoke['backward_success'] = True
+
+        smoke['stage'] = 'optimizer.step'
+        optimizer.step()
+        smoke['optimizer_step_success'] = True
+        smoke['output_has_nan'] = bool(torch.isnan(recon_image).any().item())
+        smoke['output_has_inf'] = bool(torch.isinf(recon_image).any().item())
+
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+            peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        else:
+            peak_allocated = 0.0
+            peak_reserved = 0.0
+        runtime = time.perf_counter() - start_time
+
+        print('[Smoke Test Result]')
+        print('configuration: model={} channel={} C={} SCsize={} distortion={} multiple_snr={} lambda_loss={} batch_size={}'.format(
+            args.model, args.channel_type, args.C, args.SCsize, args.distortion_metric,
+            args.multiple_snr, args.lambda_loss, args.smoke_batch_size))
+        print('input_image_shape:', smoke['input_shape'])
+        print('selected_codeword_shape:', smoke['selected_codeword_shape'])
+        print('selected_codeword_index:', smoke['selected_codeword_index'])
+        print('residual_shape:', smoke['residual_shape'])
+        print('encoder_latent_shape:', smoke['latent_shape'])
+        print('mu_shape:', smoke['mu_shape'])
+        print('std_shape:', smoke['std_shape'])
+        print('channel_output_shape:', smoke['channel_output_shape'])
+        print('decoder_output_shape:', smoke['decoder_output_shape'])
+        print('final_reconstruction_shape:', smoke['reconstruction_shape'])
+        print('actual_snr:', float(actual_snr))
+        print('distortion_loss:', float(loss_G.detach().item()))
+        print('proposed_loss:', float(loss_P.detach().item()))
+        print('total_loss:', float(loss.detach().item()))
+        print('losses_finite:', smoke['losses_finite'])
+        print('backward_success:', smoke['backward_success'])
+        print('optimizer_step_success:', smoke['optimizer_step_success'])
+        print('output_has_nan:', smoke['output_has_nan'])
+        print('output_has_inf:', smoke['output_has_inf'])
+        print('gpu_peak_allocated_mib: {:.2f}'.format(peak_allocated))
+        print('gpu_peak_reserved_mib: {:.2f}'.format(peak_reserved))
+        print('runtime_seconds: {:.3f}'.format(runtime))
+        return True
+    except torch.cuda.OutOfMemoryError:
+        if device.type == 'cuda':
+            peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        else:
+            peak_allocated = 0.0
+            peak_reserved = 0.0
+        runtime = time.perf_counter() - start_time
+        print('[Smoke Test OOM]')
+        print('stage:', smoke['stage'])
+        print('gpu_peak_allocated_mib: {:.2f}'.format(peak_allocated))
+        print('gpu_peak_reserved_mib: {:.2f}'.format(peak_reserved))
+        print('runtime_seconds: {:.3f}'.format(runtime))
+        return False
+    finally:
+        for hook in hooks:
+            hook.remove()
 
 
 def train_one_epoch(args, lambda_loss_local, H_fading_all):
@@ -542,7 +716,13 @@ if __name__ == '__main__':
 
     global_step = 0
     steps_epoch = global_step // train_loader.__len__()
-    if args.training:
+    if args.smoke_test:
+        epoch = 0
+        cur_lr = 0.01
+        optimizer = optim.Adam(model_params, lr=cur_lr)
+        if not run_smoke_test(args, H_fading_all):
+            raise SystemExit(1)
+    elif args.training:
         lambda_loss = args.lambda_loss
         
         for epoch in range(steps_epoch, config.tot_epoch):  
