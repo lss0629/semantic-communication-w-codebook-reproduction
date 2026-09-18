@@ -11,7 +11,6 @@ from loss.distortion import *
 from torchvision.utils import save_image
 import time
 import pdb
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import numpy as np
 import math
 
@@ -40,12 +39,15 @@ parser.add_argument('--multiple-snr', type=str, default='1,4,7,10,13',
                     help='random or fixed snr')
 parser.add_argument('--seed', type=int, default=1024,
                     help='random seed')
+parser.add_argument('--num-workers', type=int, default=0,
+                    help='DataLoader worker processes (0 is safest on Windows)')
 parser.add_argument('--SCsize', type=int, default=32,
                     choices=[10, 16, 32, 64],
                     help='SC size')
 parser.add_argument('--lambda_loss', type=float, default='0.01',
                     help='lambda in the loss function')
 args = parser.parse_args()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def conv_relu(in_channels, out_channels, kernel, stride=1, padding=0):
     layer = nn.Sequential(
@@ -145,13 +147,14 @@ class GoogLeNet(nn.Module):
 class config():
     seed = 1024  # random seed
     pass_channel = True
-    CUDA = True
-    device = torch.device("cuda:3")
+    CUDA = torch.cuda.is_available()
+    device = device
+    num_workers = args.num_workers
     norm = False
     # logger
     print_step = 100
     plot_step = 10000
-    filename = datetime.now().__str__()[:-7]
+    filename = windows_safe_timestamp()
     workdir = './history/{}'.format(filename)
     log = workdir + '/Log_{}.log'.format(filename)
     samples = workdir + '/samples'
@@ -214,13 +217,10 @@ class config():
         )
 
 
-if args.trainset == 'CIFAR10':
-    CalcuSSIM = MS_SSIM(window_size=3, data_range=1., levels=4, channel=3).cuda()
-else:
-    CalcuSSIM = MS_SSIM(data_range=1., levels=4, channel=3).cuda()
+CalcuSSIM = None
 
 def load_weights(model_path):
-    pretrained = torch.load(model_path)
+    pretrained = torch.load(model_path, map_location=device, weights_only=True)
     net.load_state_dict(pretrained, strict=True)
     del pretrained
 
@@ -245,8 +245,8 @@ def train_one_epoch(args, lambda_loss_local, H_fading_all):
             global_step += 1
             label_np = label.numpy()
 
-            input = input.cuda()
-            label = label.cuda()
+            input = input.to(device)
+            label = label.to(device)
 
             # search for the codeword
             code_assist = input.clone() 
@@ -315,7 +315,7 @@ def train_one_epoch(args, lambda_loss_local, H_fading_all):
                         mse_ini = mse_local
                 code_index.append(code_index_local)
 
-            code_index = torch.from_numpy(np.array(code_index)).cuda()
+            code_index = torch.from_numpy(np.array(code_index)).to(device)
             recon_image, CBR, SNR, mse, loss_G, loss_P = net(input, code_assist, code_index, H_fading)  # loss_G is the loss for generating image
 
             # loss_G = loss_G + config.alpha * loss_P
@@ -411,8 +411,8 @@ def test(H_fading_all):
                     H_id = int(epoch * batch_idx) % 19999
                     H_fading = H_fading_all[H_id]  
 
-                    input = input.cuda()
-                    label = label.cuda()
+                    input = input.to(device)
+                    label = label.to(device)
 
                     # search for the codeword
                     code_assist = input.clone()  
@@ -482,7 +482,7 @@ def test(H_fading_all):
                         # print('code_index_local', code_index_local)
                         code_index.append(code_index_local)
 
-                    code_index = torch.from_numpy(np.array(code_index)).cuda()
+                    code_index = torch.from_numpy(np.array(code_index)).to(device)
                     recon_image, CBR, SNR, mse, loss_G, loss_P = net(input, code_assist, code_index, H_fading)  # loss_G is the loss for generating image
 
                     elapsed.update(time.time() - start_time)
@@ -541,6 +541,18 @@ if __name__ == '__main__':
     logger.info(config.__dict__)
     torch.manual_seed(seed=args.seed)
 
+    if args.trainset == 'CIFAR10':
+        CalcuSSIM = MS_SSIM(window_size=3, data_range=1., levels=4, channel=3).to(device)
+    else:
+        CalcuSSIM = MS_SSIM(data_range=1., levels=4, channel=3).to(device)
+
+    for output_dir in (
+            './results_data', './results_data/results_LSC_loss',
+            './results_data/results_LSC_loss_Fading',
+            './saved_model/awgn/STL10', './saved_model/rayleigh/STL10',
+            './image_recover_LSC_loss', './image_recover_LSC_loss_Fading'):
+        makedirs(output_dir)
+
     snr_ini = int(args.multiple_snr.split(",")[0])
 
     net = WITT(args, config)
@@ -549,7 +561,7 @@ if __name__ == '__main__':
 
     # load the codebook
     codebook_np = np.load('./results_data/LSC_size' + str(args.SCsize) + '.npy')
-    codebook = torch.from_numpy(codebook_np).cuda()
+    codebook = torch.from_numpy(codebook_np).to(device)
     codebook = codebook.view(args.SCsize, 3, 256, 256)
 
     if args.channel_type == 'awgn':
@@ -566,8 +578,8 @@ if __name__ == '__main__':
     CE_loss = nn.CrossEntropyLoss()
     MSE_loss = nn.MSELoss()
     classifier = GoogLeNet(3, 10)  
-    classifier.load_state_dict(torch.load('google_net.pkl'))
-    classifier.cuda()
+    classifier.load_state_dict(torch.load('google_net.pkl', map_location=device, weights_only=True))
+    classifier.to(device)
 
     optimizer_classifier = torch.optim.SGD(classifier.parameters(), lr=0.0001)  # fine-tune the classifier, the learning rate should be very small
 
@@ -579,7 +591,7 @@ if __name__ == '__main__':
     test_SSIM_all = []
     global_func()
 
-    net = net.cuda()
+    net = net.to(device)
     model_params = [{'params': net.parameters(), 'lr': 0.0001}]
     # model_params = [{'params': net.parameters(), 'lr': 0.0005}]  # the higher learning rate, the smaller epoch
     train_loader, test_loader = get_loader(args, config)

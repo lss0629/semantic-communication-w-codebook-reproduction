@@ -7,6 +7,15 @@ import logging
 import time
 
 
+def windows_safe_timestamp():
+    """Return a timestamp that is valid in Windows file and directory names."""
+    return time.strftime('%Y-%m-%d_%H-%M-%S')
+
+
+def _sanitize_filename_component(value):
+    return str(value).replace(':', '-').replace(' ', '_')
+
+
 class AverageMeter:
     """Compute running average."""
 
@@ -30,6 +39,14 @@ class AverageMeter:
 
 
 def logger_configuration(config, save_log=False, test_mode=False):
+    if hasattr(config, 'filename'):
+        safe_filename = _sanitize_filename_component(config.filename)
+        if safe_filename != config.filename:
+            config.filename = safe_filename
+            config.workdir = os.path.join('.', 'history', safe_filename)
+            config.log = os.path.join(config.workdir, 'Log_{}.log'.format(safe_filename))
+            config.samples = os.path.join(config.workdir, 'samples')
+            config.models = os.path.join(config.workdir, 'models')
     # 配置 logger
     logger = logging.getLogger("Deep joint source channel coder")
     if test_mode:
@@ -53,10 +70,11 @@ def logger_configuration(config, save_log=False, test_mode=False):
     return config.logger
 
 def makedirs(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    os.makedirs(directory, exist_ok=True)
 
 def save_model(model, save_path):
+    parent = os.path.dirname(os.path.abspath(save_path))
+    makedirs(parent)
     torch.save(model.state_dict(), save_path)
 
 
@@ -65,7 +83,8 @@ def seed_torch(seed=1029):
     os.environ['PYTHONHASHSEED'] = str(seed)  # 为了禁止hash随机化，使得实验可复现
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True

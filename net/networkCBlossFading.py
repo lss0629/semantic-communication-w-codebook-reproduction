@@ -76,8 +76,8 @@ class WITT(nn.Module):
 
         for i in range(len(W)):  # for each codeword W
             WX_counter = 0  # number of times the i-th W is selected in a batch
-            mu_local = torch.zeros(1).cuda()  
-            sigma_local = torch.zeros(1).cuda()
+            mu_local = torch.zeros(1, device=mu.device)
+            sigma_local = torch.zeros(1, device=mu.device)
             for imageID in range(mu.size()[0]):
                 if codeID[imageID] == W[i]:  # W is chosen by the imageID-th source image
                     WX_counter += 1 

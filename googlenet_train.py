@@ -6,7 +6,6 @@ sys.path.append("...")
 
 import numpy as np
 import torch
-from torch.autograd import Variable
 from torch import nn
 # from torchvision.datasets import CIFAR10
 from torchvision import datasets
@@ -125,9 +124,9 @@ def data_tf(x):
 def get_loader(config):
     """Builds and returns Dataloader for MNIST and SVHN dataset."""
 
-    train_set = datasets.STL10(root=config.stl_path, transform=data_tf, download=True)
+    train_set = datasets.STL10(root=config.stl_path, split='train', transform=data_tf, download=True)
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=64, shuffle=True)
-    test_set = datasets.STL10(root=config.stl_path, transform=data_tf, download=True)
+    test_set = datasets.STL10(root=config.stl_path, split='test', transform=data_tf, download=True)
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=32, shuffle=False)
     
 
@@ -144,8 +143,8 @@ def get_acc(output, label):
 
 
 def train(net, train_data, valid_data, num_epochs, criterion):
-    if torch.cuda.is_available():
-        net = net.cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    net = net.to(device)
     prev_time = datetime.now()
     for epoch in range(num_epochs):
         train_loss = 0
@@ -167,12 +166,8 @@ def train(net, train_data, valid_data, num_epochs, criterion):
             optimizer = torch.optim.SGD(net.parameters(), lr=0.0005)
 
         for im, label in train_data:
-            if torch.cuda.is_available():
-                im = Variable(im.cuda())  # batch, 3, 96, 96
-                label = Variable(label.cuda())
-            else:
-                im = Variable(im)
-                label = Variable(label)
+            im = im.to(device)  # batch, 3, 96, 96
+            label = label.to(device)
             # forward
             output = net(im)
             loss = criterion(output, label)
@@ -192,18 +187,15 @@ def train(net, train_data, valid_data, num_epochs, criterion):
             valid_loss = 0
             valid_acc = 0
             net = net.eval()
-            for im, label in valid_data:
-                if torch.cuda.is_available():
-                    im = Variable(im.cuda(), volatile=True)
-                    label = Variable(label.cuda(), volatile=True)
-                else:
-                    im = Variable(im, volatile=True)
-                    label = Variable(label, volatile=True)
-                output = net(im)
-                loss = criterion(output, label)
+            with torch.no_grad():
+                for im, label in valid_data:
+                    im = im.to(device)
+                    label = label.to(device)
+                    output = net(im)
+                    loss = criterion(output, label)
 
-                valid_loss += loss.item()
-                valid_acc += get_acc(output, label)
+                    valid_loss += loss.item()
+                    valid_acc += get_acc(output, label)
             epoch_str = (
                     "Epoch %d. Train Loss: %f, Train Acc: %f, Valid Loss: %f, Valid Acc: %f, "
                     % (epoch, train_loss / len(train_data),
@@ -219,26 +211,108 @@ def train(net, train_data, valid_data, num_epochs, criterion):
         torch.save(net.state_dict(), 'google_net.pkl')
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+def smoke_test(net, train_data, test_data, criterion):
+    if not torch.cuda.is_available():
+        raise RuntimeError('--smoke-test requires a CUDA GPU')
 
-parser = argparse.ArgumentParser()
+    device = torch.device('cuda')
+    torch.cuda.reset_peak_memory_stats(device)
+    net = net.to(device)
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.02)
 
-# model hyper-parameters
-parser.add_argument('--image_size', type=int, default=96)
-parser.add_argument('--num_classes', type=int, default=10)
+    train_losses = []
+    train_batch_shape = None
+    label_shape = None
+    model_output_shape = None
+    backward_success = False
+    optimizer_step_success = False
 
-# misc
-parser.add_argument('--stl_path', type=str, default="./media/Dataset/CIFAR10/")
+    net.train()
+    for _ in range(1):
+        for batch_index, (im, label) in enumerate(train_data):
+            if batch_index >= 2:
+                break
 
-config = parser.parse_args()
-print(config)
+            im = im.to(device)
+            label = label.to(device)
+            output = net(im)
+            loss = criterion(output, label)
 
-# model and
-train_data, test_data = get_loader(config)
-net = GoogLeNet(3, 10)
-# optimizer = torch.optim.SGD(net.parameters(), lr=0.002)
-criterion = nn.CrossEntropyLoss()
+            if train_batch_shape is None:
+                train_batch_shape = tuple(im.shape)
+                label_shape = tuple(label.shape)
+                model_output_shape = tuple(output.shape)
 
-train(net, train_data, test_data, 200, criterion)
+            optimizer.zero_grad()
+            loss.backward()
+            backward_success = True
+            optimizer.step()
+            optimizer_step_success = True
+            train_losses.append(loss.item())
+
+    test_loss_sum = 0.0
+    test_correct = 0
+    test_samples = 0
+    net.eval()
+    with torch.no_grad():
+        for batch_index, (im, label) in enumerate(test_data):
+            if batch_index >= 2:
+                break
+
+            im = im.to(device)
+            label = label.to(device)
+            output = net(im)
+            loss = criterion(output, label)
+            test_loss_sum += loss.item() * label.shape[0]
+            test_correct += (output.argmax(dim=1) == label).sum().item()
+            test_samples += label.shape[0]
+
+    checkpoint_path = 'google_net_smoke.pkl'
+    torch.save(net.state_dict(), checkpoint_path)
+    checkpoint_saved = os.path.isfile(checkpoint_path)
+    torch.cuda.synchronize(device)
+    max_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    print('Smoke test results:')
+    print('  train dataset size: {}'.format(len(train_data.dataset)))
+    print('  test dataset size: {}'.format(len(test_data.dataset)))
+    print('  train batch tensor shape: {}'.format(train_batch_shape))
+    print('  label shape: {}'.format(label_shape))
+    print('  model output shape: {}'.format(model_output_shape))
+    print('  first training loss: {:.6f}'.format(train_losses[0]))
+    print('  last training loss: {:.6f}'.format(train_losses[-1]))
+    print('  test loss: {:.6f}'.format(test_loss_sum / test_samples))
+    print('  test accuracy: {:.6f}'.format(test_correct / test_samples))
+    print('  backward success: {}'.format(backward_success))
+    print('  optimizer.step success: {}'.format(optimizer_step_success))
+    print('  checkpoint saved: {} ({})'.format(checkpoint_saved, checkpoint_path))
+    print('  device: {} ({})'.format(device, torch.cuda.get_device_name(device)))
+    print('  GPU max VRAM: {:.2f} MiB'.format(max_vram_mib))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    # model hyper-parameters
+    parser.add_argument('--image_size', type=int, default=96)
+    parser.add_argument('--num_classes', type=int, default=10)
+
+    # misc
+    parser.add_argument('--stl_path', type=str, default="./media/Dataset/CIFAR10/")
+    parser.add_argument('--smoke-test', action='store_true')
+
+    config = parser.parse_args()
+    print(config)
+
+    # model and
+    train_data, test_data = get_loader(config)
+    net = GoogLeNet(3, 10)
+    # optimizer = torch.optim.SGD(net.parameters(), lr=0.002)
+    criterion = nn.CrossEntropyLoss()
+
+    if config.smoke_test:
+        smoke_test(net, train_data, test_data, criterion)
+    else:
+        train(net, train_data, test_data, 200, criterion)
 
 

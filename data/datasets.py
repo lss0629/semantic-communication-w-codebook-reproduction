@@ -10,9 +10,14 @@ import torch
 import math
 import torch.utils.data as data
 
-NUM_DATASET_WORKERS = 8
+NUM_DATASET_WORKERS = 0
 SCALE_MIN = 0.75
 SCALE_MAX = 0.95
+
+
+def worker_init_fn_seed(worker_id):
+    """Seed NumPy in DataLoader workers; kept at module scope for Windows spawn."""
+    np.random.seed(10 + worker_id)
 
 
 class HR_image(Dataset):
@@ -98,10 +103,7 @@ def data_tf(x):
 
 
 def get_loader(args, config):
-    def worker_init_fn_seed(worker_id):
-        seed = 10
-        seed += worker_id
-        np.random.seed(seed)
+    num_workers = getattr(config, 'num_workers', NUM_DATASET_WORKERS)
 
     if args.trainset == 'DIV2K':
         train_dataset = HR_image(config, config.train_data_dir)
@@ -125,11 +127,12 @@ def get_loader(args, config):
         train_loader = torch.utils.data.DataLoader(dataset=train_dataset, 
                                                    batch_size=config.batch_size, 
                                                    shuffle=True, 
-                                                   num_workers=NUM_DATASET_WORKERS, 
+                                                   num_workers=num_workers,
                                                    drop_last=True, 
                                                    pin_memory=True, 
                                                    worker_init_fn=worker_init_fn_seed)
-        test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=8, shuffle=False)
+        test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=8,
+                                                  shuffle=False, num_workers=num_workers)
 
         return train_loader, test_loader
 
@@ -169,7 +172,7 @@ def get_loader(args, config):
 
     # loader
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                               num_workers=NUM_DATASET_WORKERS,
+                                               num_workers=num_workers,
                                                pin_memory=True,
                                                batch_size=config.batch_size,
                                                worker_init_fn=worker_init_fn_seed,
@@ -178,12 +181,14 @@ def get_loader(args, config):
     if args.trainset == 'CIFAR10':
         test_loader = data.DataLoader(dataset=test_dataset,
                                   batch_size=1024,
-                                  shuffle=False)
+                                  shuffle=False,
+                                  num_workers=num_workers)
 
     else:
         test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
                                               batch_size=1,
-                                              shuffle=False)
+                                              shuffle=False,
+                                              num_workers=num_workers)
 
     return train_loader, test_loader
 

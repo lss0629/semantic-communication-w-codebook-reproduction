@@ -35,8 +35,8 @@ if __name__ == '__main__':
     CBsize = 64  # codebook size, 8 16 32 64
 
     torch.manual_seed(1024)
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs('./results_data', exist_ok=True)
     print('device:', device)   
     batchsize = CBsize
     epoch_len = 500
@@ -94,4 +94,3 @@ if __name__ == '__main__':
 
 
 
-                

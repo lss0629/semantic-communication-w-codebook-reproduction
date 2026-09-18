@@ -13,7 +13,6 @@ import torchvision.datasets as datasets
 import time
 import warnings
 import pdb
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 
 warnings.filterwarnings("ignore")
@@ -146,6 +145,7 @@ if __name__ == '__main__':
 
     torch.manual_seed(1024)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs('./results_data', exist_ok=True)
     print('device:', device)   
     batchsize = CBsize
     epoch_len = 500
@@ -160,7 +160,7 @@ if __name__ == '__main__':
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=batchsize, shuffle=True, drop_last=False)
 
     classifier = GoogLeNet(3, 10)  
-    classifier.load_state_dict(torch.load('google_net.pkl'))
+    classifier.load_state_dict(torch.load('google_net.pkl', map_location=device, weights_only=True))
     classifier.to(device)
 
     print('Codebook Construction Start!')
@@ -315,4 +315,3 @@ if __name__ == '__main__':
 
 
 
-                

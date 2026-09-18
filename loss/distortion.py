@@ -210,9 +210,9 @@ class Distortion(torch.nn.Module):
             self.dist = SSIM()
         elif args.distortion_metric == 'MS-SSIM':
             if args.trainset == 'CIFAR10':
-                self.dist = MS_SSIM(window_size=3, data_range=1., levels=4, channel=3).cuda()
+                self.dist = MS_SSIM(window_size=3, data_range=1., levels=4, channel=3)
             else:
-                self.dist = MS_SSIM(data_range=1., levels=4, channel=3).cuda()
+                self.dist = MS_SSIM(data_range=1., levels=4, channel=3)
         else:
             args.logger.info("Unknown distortion type!")
             raise ValueError
@@ -222,8 +222,9 @@ class Distortion(torch.nn.Module):
 
 
 if __name__ == '__main__':
-    rand_im1 = (torch.randint(0, 255, [4, 3, 256, 128], dtype=torch.float32) / 255.).cuda()
-    rand_im2 = (torch.randint(0, 255, [4, 3, 256, 128], dtype=torch.float32) / 255.).cuda()
-    losser = MS_SSIM(data_range=1., levels=4, channel=3).cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rand_im1 = (torch.randint(0, 255, [4, 3, 256, 128], dtype=torch.float32) / 255.).to(device)
+    rand_im2 = (torch.randint(0, 255, [4, 3, 256, 128], dtype=torch.float32) / 255.).to(device)
+    losser = MS_SSIM(data_range=1., levels=4, channel=3).to(device)
     loss = losser(rand_im1, rand_im2)
     print(loss)

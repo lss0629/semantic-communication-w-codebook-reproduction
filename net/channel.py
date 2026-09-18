@@ -23,7 +23,7 @@ class Channel(nn.Module):
                 args.channel_type, args.multiple_snr))
 
     def gaussian_noise_layer(self, input_layer, std, name=None):
-        device = input_layer.get_device()
+        device = input_layer.device
         noise_real = torch.normal(mean=0.0, std=std, size=np.shape(input_layer), device=device)
         noise_imag = torch.normal(mean=0.0, std=std, size=np.shape(input_layer), device=device)
         noise = noise_real + 1j * noise_imag
@@ -36,8 +36,8 @@ class Channel(nn.Module):
         h = torch.sqrt(torch.normal(mean=0.0, std=1, size=np.shape(input_layer)) ** 2
                        + torch.normal(mean=0.0, std=1, size=np.shape(input_layer)) ** 2) / np.sqrt(2)
         if self.config.CUDA:
-            noise = noise.to(input_layer.get_device())
-            h = h.to(input_layer.get_device())
+            noise = noise.to(input_layer.device)
+            h = h.to(input_layer.device)
         return input_layer * h + noise
 
 

@@ -135,7 +135,7 @@ class SwinTransformerBlock(nn.Module):
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-            self.attn_mask = attn_mask.cuda()
+            self.attn_mask = attn_mask.to(next(self.parameters()).device)
         else:
             pass
 
