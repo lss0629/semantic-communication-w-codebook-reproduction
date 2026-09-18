@@ -66,3 +66,12 @@ This compatibility pass changes device selection, Windows-safe paths, DataLoader
 PyTorch 2.6 loading behavior, and output-directory creation only. It does not change the paper's
 model dimensions, codebook assignment, proposed loss, optimizer schedule, SNR policy, or channel
 equations.
+
+## Semantic-aware codebook final output
+
+`SC_construction.py` accepts `--SCsize {10,16,32,64}` and preserves the original default value of
+`10`. The periodic checkpoint behavior is unchanged: a codebook is saved every 10 loop epochs.
+After all construction epochs complete, the script saves the final in-memory codebook state once
+more to the same `results_data/SC_size{SCsize}.npy` path. This final-output correctness fix prevents
+the last nine update epochs from being absent from the output file; it does not change codeword
+distance, assignment, update, preprocessing, or iteration-count logic.

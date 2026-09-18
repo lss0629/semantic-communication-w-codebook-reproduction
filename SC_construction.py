@@ -1,4 +1,5 @@
 from unicodedata import category
+import argparse
 import torch
 import os
 import torch.nn.functional as F
@@ -138,35 +139,67 @@ def downsampling(input, out_size):
 
 
 if __name__ == '__main__':
-    CBsize = 10  # codebook size, 10 16 32 64  
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--smoke-test', action='store_true')
+    parser.add_argument('--SCsize', type=int, default=10, choices=[10, 16, 32, 64],
+                        help='semantic-aware codebook size')
+    args = parser.parse_args()
+
+    CBsize = args.SCsize
     lambda_loss = 10  # lambda in loss, 0.1 1 10 100
 
     torch.manual_seed(1024)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     os.makedirs('./results_data', exist_ok=True)
     print('device:', device)   
     batchsize = CBsize
-    epoch_len = 300
+    epoch_len = 2 if args.smoke_test else 300
     codebook = None
     distance_measure1 = nn.MSELoss()
     distance_measure2 = nn.CrossEntropyLoss()
     counter = np.ones(CBsize)
-    iteration_interval = 10
+    iteration_interval = 1 if args.smoke_test else 10
+    images_per_batch = 1 if args.smoke_test else batchsize
+    codebook_initial_shape = None
+    assignment_success = False
+    update_success = False
+    classifier_load_success = False
+    start_time = time.perf_counter()
 
     train_set = datasets.STL10("./media/Dataset/CIFAR10/", transform=data_tf, download=True)
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=batchsize, shuffle=True, drop_last=False)
 
+    if args.smoke_test:
+        print('dataset load success:', len(train_set) > 0)
+        print('dataset size:', len(train_set))
+
     classifier = GoogLeNet(3, 10)  
     classifier.load_state_dict(torch.load('google_net.pkl', map_location=device, weights_only=True))
+    classifier_load_success = True
     classifier.to(device)
 
     print('Codebook Construction Start!')
     
     for e in range(epoch_len):
-        print('epoch:', e)
+        elapsed = time.perf_counter() - start_time
+        if device.type == 'cuda':
+            max_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        else:
+            max_vram_mib = 0.0
+        print('epoch: {}/{} | SCsize: {} | elapsed: {:.3f} seconds | GPU peak VRAM: {:.2f} MiB'.format(
+            e + 1, epoch_len, CBsize, elapsed, max_vram_mib))
         iteration = 0
         for im, label in train_loader:
             iteration += 1
+            elapsed = time.perf_counter() - start_time
+            if device.type == 'cuda':
+                max_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+            else:
+                max_vram_mib = 0.0
+            print('  batch: {}/{} | elapsed: {:.3f} seconds | GPU peak VRAM: {:.2f} MiB'.format(
+                iteration, 1 if e == 0 else iteration_interval, elapsed, max_vram_mib))
             im = Variable(im) 
             label = Variable(label)  
             im = im.to(device)
@@ -174,6 +207,7 @@ if __name__ == '__main__':
             # initialize the codebook
             if e == 0:
                 codebook = im.clone()
+                codebook_initial_shape = tuple(codebook.shape)
                 print('codebook initialization is done ...')
                 break
 
@@ -184,7 +218,7 @@ if __name__ == '__main__':
             out_codebook = classifier(codebook_down)  # batchsize, class_num
 
 
-            for i in range(batchsize):
+            for i in range(images_per_batch):
                 for j in range(CBsize):
                     distance1 = distance_measure1(im[i], codebook[j])
                     
@@ -194,22 +228,64 @@ if __name__ == '__main__':
                     if distance < distance_min:
                         distance_min = distance
                         category = j
+                assignment_success = True
                 counter[category] += 1
                 codebook[category] = torch.add(codebook[category] * (counter[category] - 1) / counter[category], im[i] / counter[category])
+                update_success = True
 
             if iteration == iteration_interval: 
                 break
         
         print('counters:', counter)
 
-        if e % 10 == 0:
+        if (args.smoke_test and e == epoch_len - 1) or (not args.smoke_test and e % 10 == 0):
             print('save the codebook ...')
             codebook0 = codebook.clone()
             codebook0 = codebook0.view(CBsize, int(3 * 256 *256))
             np_codebook = codebook0.detach().cpu().numpy()
 
-            file = ('./results_data/SC_size%d.npy' % (CBsize))
+            if args.smoke_test:
+                file = './results_data/SC_smoke.npy'
+            else:
+                file = ('./results_data/SC_size%d.npy' % (CBsize))
             np.save(file, np_codebook)
+
+    print('save the final codebook state ...')
+    codebook0 = codebook.clone()
+    codebook0 = codebook0.view(CBsize, int(3 * 256 *256))
+    np_codebook = codebook0.detach().cpu().numpy()
+    if args.smoke_test:
+        file = './results_data/SC_smoke.npy'
+    else:
+        file = ('./results_data/SC_size%d.npy' % (CBsize))
+    np.save(file, np_codebook)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+        max_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    else:
+        max_vram_mib = 0.0
+    elapsed = time.perf_counter() - start_time
+
+    if args.smoke_test:
+        print('Smoke test results:')
+        print('  classifier load success:', classifier_load_success)
+        print('  codebook initial shape:', codebook_initial_shape)
+        print('  final codebook shape:', tuple(np_codebook.shape))
+        print('  dtype:', np_codebook.dtype)
+        print('  has NaN:', bool(np.isnan(np_codebook).any()))
+        print('  has Inf:', bool(np.isinf(np_codebook).any()))
+        print('  codeword assignment success:', assignment_success)
+        print('  update success:', update_success)
+        print('  saved:', os.path.isfile(file), '(' + file + ')')
+        print('  execution time: {:.3f} seconds'.format(elapsed))
+        print('  GPU max VRAM: {:.2f} MiB'.format(max_vram_mib))
+    else:
+        print('Full construction results:')
+        print('  SCsize:', CBsize)
+        print('  saved:', os.path.isfile(file), '(' + file + ')')
+        print('  execution time: {:.3f} seconds'.format(elapsed))
+        print('  GPU peak allocated VRAM: {:.2f} MiB'.format(max_vram_mib))
 
 
 
