@@ -144,6 +144,8 @@ def get_acc(output, label):
 
 def train(net, train_data, valid_data, num_epochs, criterion):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     net = net.to(device)
     prev_time = datetime.now()
     for epoch in range(num_epochs):
@@ -197,10 +199,11 @@ def train(net, train_data, valid_data, num_epochs, criterion):
                     valid_loss += loss.item()
                     valid_acc += get_acc(output, label)
             epoch_str = (
-                    "Epoch %d. Train Loss: %f, Train Acc: %f, Valid Loss: %f, Valid Acc: %f, "
-                    % (epoch, train_loss / len(train_data),
-                       train_acc / len(train_data), valid_loss / len(valid_data),
-                       valid_acc / len(valid_data)))
+                    "Epoch %d/%d | Train loss: %f | Test loss: %f | Test accuracy: %f | "
+                    "Learning rate: %f | "
+                    % (epoch + 1, num_epochs, train_loss / len(train_data),
+                       valid_loss / len(valid_data), valid_acc / len(valid_data),
+                       optimizer.param_groups[0]['lr']))
         else:
             epoch_str = ("Epoch %d. Train Loss: %f, Train Acc: %f, " %
                          (epoch, train_loss / len(train_data),
@@ -209,6 +212,11 @@ def train(net, train_data, valid_data, num_epochs, criterion):
         prev_time = cur_time
         print(epoch_str + time_str)
         torch.save(net.state_dict(), 'google_net.pkl')
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+        max_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        print('Full training GPU max VRAM: {:.2f} MiB'.format(max_vram_mib))
 
 
 def smoke_test(net, train_data, test_data, criterion):
