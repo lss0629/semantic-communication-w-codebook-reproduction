@@ -893,6 +893,9 @@ if __name__ == '__main__':
                 )
                 print('[Pilot Resume Warning]', classifier_warning, flush=True)
                 logger.warning(classifier_warning)
+            else:
+                classifier.load_state_dict(resume_checkpoint['classifier_state_dict'], strict=True)
+                print('[Pilot Resume] classifier_state_dict loaded with strict=True', flush=True)
             del resume_checkpoint
 
         if pilot_start_epoch >= config.tot_epoch:

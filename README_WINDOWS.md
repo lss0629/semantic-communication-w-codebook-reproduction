@@ -92,5 +92,6 @@ The Epoch 10 pilot checkpoint predates classifier checkpointing and therefore ha
 `classifier_state_dict`. On an Epoch 10 resume, the classifier is initialized from
 `google_net.pkl`; any BatchNorm running-statistic changes made during Epochs 1-10 cannot be
 recovered. This limitation is reported in the resume log. Starting with the Epoch 15 checkpoint,
-pilot checkpoints include `classifier_state_dict` for more complete future resume metadata. Adding
-this saved state does not change classifier or codec training behavior.
+pilot checkpoints include `classifier_state_dict`, and the pilot resume path restores it with
+`strict=True` when present. Adding and restoring this saved state does not change classifier or
+codec training behavior outside the requested resume continuity.
