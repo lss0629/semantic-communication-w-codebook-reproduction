@@ -118,8 +118,8 @@ def get_loader(args, config):
                 transforms.ToTensor(),
                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         
-        train_dataset = datasets.STL10(root=config.train_data_dir, transform=data_tf, download=True)
-        test_dataset = datasets.STL10(root=config.train_data_dir, transform=data_tf, download=True)
+        train_dataset = datasets.STL10(root=config.train_data_dir, split='train', transform=data_tf, download=True)
+        test_dataset = datasets.STL10(root=config.train_data_dir, split='test', transform=data_tf, download=True)
 
         # train_dataset = datasets.STL10(root=config.train_data_dir, transform=transform_data, download=True)
         # test_dataset = datasets.STL10(root=config.train_data_dir, transform=transform_data, download=True)

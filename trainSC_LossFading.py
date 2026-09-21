@@ -50,8 +50,22 @@ parser.add_argument('--smoke-test', action='store_true',
                     help='run exactly one training batch without saving checkpoints')
 parser.add_argument('--smoke-batch-size', type=int, default=1,
                     help='batch size used only with --smoke-test')
+parser.add_argument('--benchmark-one-epoch', action='store_true',
+                    help='run one training epoch with batch size 4 and no checkpoint/evaluation')
+parser.add_argument('--pilot-training', action='store_true',
+                    help='run the bounded pilot path with per-epoch evaluation and pilot checkpoints')
+parser.add_argument('--epochs', type=int, default=500000,
+                    help='number of training epochs (original default: 500000)')
+parser.add_argument('--batch-size', type=int, default=12,
+                    help='STL10 training batch size (original default: 12)')
 args = parser.parse_args()
-if args.smoke_test:
+if sum((args.smoke_test, args.benchmark_one_epoch, args.pilot_training)) > 1:
+    parser.error('--smoke-test, --benchmark-one-epoch, and --pilot-training are mutually exclusive')
+if args.epochs <= 0:
+    parser.error('--epochs must be positive')
+if args.batch_size <= 0:
+    parser.error('--batch-size must be positive')
+if args.smoke_test or args.benchmark_one_epoch:
     if args.smoke_batch_size <= 0:
         parser.error('--smoke-batch-size must be positive')
     args.training = True
@@ -63,6 +77,8 @@ if args.smoke_test:
     args.multiple_snr = '10'
     args.lambda_loss = 0.01
     args.num_workers = 0
+if args.pilot_training:
+    args.training = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def conv_relu(in_channels, out_channels, kernel, stride=1, padding=0):
@@ -183,7 +199,7 @@ class config():
     # learning_rate = 0.0005
 
     # tot_epoch = 10000000
-    tot_epoch = 500000
+    tot_epoch = args.epochs
 
     if args.trainset == 'CIFAR10':
         save_model_freq = 50  # save model epoch
@@ -217,7 +233,12 @@ class config():
         train_data_dir = "./media/Dataset/CIFAR10/"
         test_data_dir = "./media/Dataset/CIFAR10/"
         # batch_size = 128 
-        batch_size = args.smoke_batch_size if args.smoke_test else 12
+        if args.smoke_test:
+            batch_size = args.smoke_batch_size
+        elif args.benchmark_one_epoch:
+            batch_size = 4
+        else:
+            batch_size = args.batch_size
         downsample = 4
         encoder_kwargs = dict(
             img_size=(image_dims[1], image_dims[2]), patch_size=2, in_chans=3,
@@ -409,6 +430,26 @@ def train_one_epoch(args, lambda_loss_local, H_fading_all):
     net.train()
     elapsed, losses, psnrs, msssims, cbrs, snrs, accs = [AverageMeter() for _ in range(7)]
     metrics = [elapsed, losses, psnrs, msssims, cbrs, snrs, accs]
+    benchmark_stats = None
+    if args.benchmark_one_epoch or args.pilot_training:
+        benchmark_stats = {
+            'batches': 0,
+            'processed_images': 0,
+            'first_loss': None,
+            'final_loss': None,
+            'distortion_loss_sum': 0.0,
+            'proposed_loss_sum': 0.0,
+            'total_loss_sum': 0.0,
+            'has_nan': False,
+            'has_inf': False,
+            'backward_success': True,
+            'optimizer_step_success': True,
+        }
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+        benchmark_start = time.perf_counter()
     global global_step
     if args.trainset == 'CIFAR10' or args.trainset == 'STL10':
         for batch_idx, (input, label) in enumerate(train_loader): 
@@ -495,7 +536,7 @@ def train_one_epoch(args, lambda_loss_local, H_fading_all):
                     msssims.update(100)
                     accs.update(100)
 
-                if batch_idx % 50 == 0 and epoch % 5 == 0:
+                if not (args.benchmark_one_epoch or args.pilot_training) and batch_idx % 50 == 0 and epoch % 5 == 0:
                     # save image                      
                     recon_image = downsampling(recon_image, 512)
                     # recon_image0 = downsampling(input, 512)
@@ -532,8 +573,63 @@ def train_one_epoch(args, lambda_loss_local, H_fading_all):
                     val_SSIM_all.append(msssims.val)
                     train_SSIM_all.append(msssims.avg)
 
+            if benchmark_stats is not None:
+                distortion_value = float(loss_G.detach().item())
+                proposed_value = float(loss_P.detach().item())
+                total_value = float(loss.detach().item())
+                if benchmark_stats['first_loss'] is None:
+                    benchmark_stats['first_loss'] = total_value
+                benchmark_stats['final_loss'] = total_value
+                benchmark_stats['distortion_loss_sum'] += distortion_value
+                benchmark_stats['proposed_loss_sum'] += proposed_value
+                benchmark_stats['total_loss_sum'] += total_value
+                benchmark_stats['batches'] += 1
+                benchmark_stats['processed_images'] += input.size(0)
+                benchmark_stats['has_nan'] = (
+                    benchmark_stats['has_nan']
+                    or math.isnan(distortion_value)
+                    or math.isnan(proposed_value)
+                    or math.isnan(total_value)
+                    or bool(torch.isnan(recon_image).any().item()))
+                benchmark_stats['has_inf'] = (
+                    benchmark_stats['has_inf']
+                    or math.isinf(distortion_value)
+                    or math.isinf(proposed_value)
+                    or math.isinf(total_value)
+                    or bool(torch.isinf(recon_image).any().item()))
+                if args.benchmark_one_epoch and (
+                        benchmark_stats['batches'] % 100 == 0
+                        or benchmark_stats['batches'] == len(train_loader)):
+                    benchmark_elapsed = time.perf_counter() - benchmark_start
+                    if device.type == 'cuda':
+                        current_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    else:
+                        current_peak = 0.0
+                    print('benchmark batch: {}/{} | images: {} | elapsed: {:.3f} seconds | peak allocated: {:.2f} MiB'.format(
+                        benchmark_stats['batches'], len(train_loader),
+                        benchmark_stats['processed_images'], benchmark_elapsed, current_peak), flush=True)
+
     for i in metrics:
         i.clear()
+    if benchmark_stats is not None:
+        if args.benchmark_one_epoch:
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+                benchmark_stats['peak_allocated_mib'] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                benchmark_stats['peak_reserved_mib'] = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            else:
+                benchmark_stats['peak_allocated_mib'] = 0.0
+                benchmark_stats['peak_reserved_mib'] = 0.0
+            benchmark_stats['epoch_runtime'] = time.perf_counter() - benchmark_start
+            benchmark_stats['average_batch_runtime'] = (
+                benchmark_stats['epoch_runtime'] / benchmark_stats['batches'])
+        benchmark_stats['mean_distortion_loss'] = (
+            benchmark_stats['distortion_loss_sum'] / benchmark_stats['batches'])
+        benchmark_stats['mean_proposed_loss'] = (
+            benchmark_stats['proposed_loss_sum'] / benchmark_stats['batches'])
+        benchmark_stats['mean_total_loss'] = (
+            benchmark_stats['total_loss_sum'] / benchmark_stats['batches'])
+        return lambda_loss_local, benchmark_stats
     return lambda_loss_local
 
 def test(H_fading_all):
@@ -550,6 +646,8 @@ def test(H_fading_all):
     results_psnr = np.zeros(len(multiple_snr))
     results_msssim = np.zeros(len(multiple_snr))
     for i, SNR in enumerate(multiple_snr):
+        if args.pilot_training:
+            pilot_test_start = time.perf_counter()
         with torch.no_grad():
             if args.trainset == 'CIFAR10' or args.trainset == 'STL10':
                 for batch_idx, (input, label) in enumerate(test_loader):
@@ -600,6 +698,12 @@ def test(H_fading_all):
                         msssims.update(100)
                         accs.update(100)
 
+                    if args.pilot_training and ((batch_idx + 1) % 100 == 0 or (batch_idx + 1) == len(test_loader)):
+                        print('pilot test batch: {}/{} | images: {} | elapsed: {:.3f} seconds'.format(
+                            batch_idx + 1, len(test_loader),
+                            min((batch_idx + 1) * input.shape[0], len(test_loader.dataset)),
+                            time.perf_counter() - pilot_test_start), flush=True)
+
                     log = (' | '.join([
                         f'Time {elapsed.val:.3f}',
                         f'CBR {cbrs.val:.4f} ({cbrs.avg:.4f})',
@@ -630,6 +734,13 @@ def test(H_fading_all):
     print("Acc: {}" .format(results_acc.tolist()))
     print("MS-SSIM: {}".format(results_msssim.tolist()))
     print("Finish Test!")
+    return {
+        'snr': results_snr.tolist(),
+        'cbr': results_cbr.tolist(),
+        'psnr': results_psnr.tolist(),
+        'msssim': results_msssim.tolist(),
+        'accuracy': results_acc.tolist(),
+    }
 
 
 def global_func():
@@ -658,6 +769,7 @@ if __name__ == '__main__':
             './results_data', './results_data/results_SC_loss',
             './results_data/results_SC_loss_Fading',
             './saved_model/awgn/STL10', './saved_model/rayleigh/STL10',
+            './saved_model/pilot',
             './image_recover_SC_loss', './image_recover_SC_loss_Fading'):
         makedirs(output_dir)
 
@@ -722,6 +834,150 @@ if __name__ == '__main__':
         optimizer = optim.Adam(model_params, lr=cur_lr)
         if not run_smoke_test(args, H_fading_all):
             raise SystemExit(1)
+    elif args.benchmark_one_epoch:
+        epoch = 0
+        cur_lr = 0.01
+        optimizer = optim.Adam(model_params, lr=cur_lr)
+        _, benchmark_stats = train_one_epoch(args, args.lambda_loss, H_fading_all)
+        print('[One Epoch Benchmark Result]')
+        print('configuration: model={} channel={} C={} SCsize={} distortion={} multiple_snr={} lambda_loss={} batch_size={}'.format(
+            args.model, args.channel_type, args.C, args.SCsize, args.distortion_metric,
+            args.multiple_snr, args.lambda_loss, config.batch_size))
+        print('total_batches:', benchmark_stats['batches'])
+        print('processed_images:', benchmark_stats['processed_images'])
+        print('first_batch_total_loss:', benchmark_stats['first_loss'])
+        print('final_batch_total_loss:', benchmark_stats['final_loss'])
+        print('epoch_mean_distortion_loss:', benchmark_stats['mean_distortion_loss'])
+        print('epoch_mean_proposed_loss:', benchmark_stats['mean_proposed_loss'])
+        print('epoch_mean_total_loss:', benchmark_stats['mean_total_loss'])
+        print('learning_rate:', cur_lr)
+        print('epoch_runtime_seconds: {:.3f}'.format(benchmark_stats['epoch_runtime']))
+        print('average_batch_runtime_seconds: {:.6f}'.format(benchmark_stats['average_batch_runtime']))
+        print('gpu_peak_allocated_mib: {:.2f}'.format(benchmark_stats['peak_allocated_mib']))
+        print('gpu_peak_reserved_mib: {:.2f}'.format(benchmark_stats['peak_reserved_mib']))
+        print('has_nan:', benchmark_stats['has_nan'])
+        print('has_inf:', benchmark_stats['has_inf'])
+        print('backward_success:', benchmark_stats['backward_success'])
+        print('optimizer_step_success:', benchmark_stats['optimizer_step_success'])
+    elif args.pilot_training:
+        lambda_loss = args.lambda_loss
+        pilot_history = []
+        pilot_total_start = time.perf_counter()
+        pilot_checkpoint = './saved_model/pilot/latest.pt'
+
+        for epoch in range(steps_epoch, config.tot_epoch):
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize(device)
+            pilot_epoch_start = time.perf_counter()
+
+            if epoch < 200:
+                cur_lr = 0.01
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+            elif epoch < 400:
+                cur_lr = 0.005
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+            elif epoch < 550:
+                cur_lr = 0.002
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+            elif epoch < 650:
+                cur_lr = 0.001
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+            elif epoch < 750:
+                cur_lr = 0.0005
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+            else:
+                cur_lr = 0.0001
+                optimizer = optim.Adam(model_params, lr=cur_lr)
+
+            try:
+                lambda_loss, train_stats = train_one_epoch(args, lambda_loss, H_fading_all)
+            except torch.cuda.OutOfMemoryError:
+                peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+                print('Pilot stopped: CUDA OOM during training at epoch {} | peak allocated {:.2f} MiB | peak reserved {:.2f} MiB'.format(
+                    epoch + 1, peak_allocated, peak_reserved))
+                raise SystemExit(1)
+            if train_stats['has_nan'] or train_stats['has_inf']:
+                print('Pilot stopped: NaN/Inf detected in training at epoch {}.'.format(epoch + 1))
+                raise SystemExit(1)
+
+            try:
+                test_stats = test(H_fading_all)
+            except torch.cuda.OutOfMemoryError:
+                peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+                print('Pilot stopped: CUDA OOM during evaluation at epoch {} | peak allocated {:.2f} MiB | peak reserved {:.2f} MiB'.format(
+                    epoch + 1, peak_allocated, peak_reserved))
+                raise SystemExit(1)
+            test_psnr = float(test_stats['psnr'][0])
+            test_msssim = float(test_stats['msssim'][0])
+            test_accuracy = float(test_stats['accuracy'][0])
+            if not all(math.isfinite(value) for value in (test_psnr, test_msssim, test_accuracy)):
+                print('Pilot stopped: NaN/Inf detected in evaluation at epoch {}.'.format(epoch + 1))
+                raise SystemExit(1)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+                peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            else:
+                peak_allocated = 0.0
+                peak_reserved = 0.0
+            epoch_runtime = time.perf_counter() - pilot_epoch_start
+
+            epoch_result = {
+                'epoch': epoch + 1,
+                'learning_rate': cur_lr,
+                'train_distortion_loss': train_stats['mean_distortion_loss'],
+                'train_proposed_loss': train_stats['mean_proposed_loss'],
+                'train_total_loss': train_stats['mean_total_loss'],
+                'test_psnr': test_psnr,
+                'test_msssim': test_msssim,
+                'test_accuracy': test_accuracy,
+                'epoch_runtime_seconds': epoch_runtime,
+                'peak_allocated_mib': peak_allocated,
+                'peak_reserved_mib': peak_reserved,
+                'has_nan': train_stats['has_nan'],
+                'has_inf': train_stats['has_inf'],
+                'backward_success': train_stats['backward_success'],
+                'optimizer_step_success': train_stats['optimizer_step_success'],
+            }
+            pilot_history.append(epoch_result)
+
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'pilot_history': pilot_history,
+                'configuration': vars(args),
+            }
+            torch.save(checkpoint, pilot_checkpoint)
+            if epoch + 1 == config.tot_epoch:
+                torch.save(checkpoint, './saved_model/pilot/epoch_{:03d}.pt'.format(epoch + 1))
+
+            print('[Pilot Epoch] epoch={} lr={} train_distortion={:.9f} train_proposed={:.9f} train_total={:.9f} test_psnr={:.9f} test_msssim={:.9f} test_accuracy={:.6f} runtime_seconds={:.3f} peak_allocated_mib={:.2f} peak_reserved_mib={:.2f}'.format(
+                epoch + 1, cur_lr, train_stats['mean_distortion_loss'],
+                train_stats['mean_proposed_loss'], train_stats['mean_total_loss'],
+                test_psnr, test_msssim, test_accuracy, epoch_runtime,
+                peak_allocated, peak_reserved), flush=True)
+
+        pilot_total_runtime = time.perf_counter() - pilot_total_start
+        print('[Pilot Training Result]')
+        print('Epoch | Train Loss | PSNR | MS-SSIM | Accuracy')
+        for result in pilot_history:
+            print('{} | {:.9f} | {:.9f} | {:.9f} | {:.6f}'.format(
+                result['epoch'], result['train_total_loss'], result['test_psnr'],
+                result['test_msssim'], result['test_accuracy']))
+        print('best_psnr:', max(result['test_psnr'] for result in pilot_history))
+        print('best_msssim:', max(result['test_msssim'] for result in pilot_history))
+        print('best_accuracy:', max(result['test_accuracy'] for result in pilot_history))
+        print('total_runtime_seconds: {:.3f}'.format(pilot_total_runtime))
+        print('peak_allocated_mib:', max(result['peak_allocated_mib'] for result in pilot_history))
+        print('peak_reserved_mib:', max(result['peak_reserved_mib'] for result in pilot_history))
+        print('latest_checkpoint:', pilot_checkpoint)
+        print('final_checkpoint: ./saved_model/pilot/epoch_{:03d}.pt'.format(config.tot_epoch))
     elif args.training:
         lambda_loss = args.lambda_loss
         

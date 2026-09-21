@@ -60,6 +60,12 @@ This is an evaluation correctness fix, not a Windows compatibility fix. Dataset 
 unchanged: resize to 96 x 96, convert to float32 and scale to [0, 1], then transpose HWC to CHW,
 with no augmentation or normalization.
 
+The semantic communication loaders in `data/datasets.py` also explicitly use the official STL10
+splits: `split="train"` for the 5,000-image training set and `split="test"` for the 8,000-image
+test set. Their existing preprocessing is unchanged: resize to 256 x 256, convert to float32 and
+scale to [0, 1], then transpose HWC to CHW, with no augmentation or normalization. This is an
+evaluation correctness fix and does not change the training algorithm.
+
 ## Phase 2 scope
 
 This compatibility pass changes device selection, Windows-safe paths, DataLoader worker setup,

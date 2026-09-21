@@ -183,3 +183,7 @@ image_recover_*/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# PyTorch training checkpoints
+*.pt
+saved_model/pilot/
