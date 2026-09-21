@@ -54,13 +54,21 @@ parser.add_argument('--benchmark-one-epoch', action='store_true',
                     help='run one training epoch with batch size 4 and no checkpoint/evaluation')
 parser.add_argument('--pilot-training', action='store_true',
                     help='run the bounded pilot path with per-epoch evaluation and pilot checkpoints')
+parser.add_argument('--resume-pilot', type=str, default=None,
+                    help='resume pilot codec weights from a checkpoint; optimizer state is not restored')
+parser.add_argument('--eval-final-only', action='store_true',
+                    help='evaluate only after the final requested pilot epoch')
 parser.add_argument('--epochs', type=int, default=500000,
                     help='number of training epochs (original default: 500000)')
 parser.add_argument('--batch-size', type=int, default=12,
                     help='STL10 training batch size (original default: 12)')
 args = parser.parse_args()
+if args.resume_pilot:
+    args.pilot_training = True
 if sum((args.smoke_test, args.benchmark_one_epoch, args.pilot_training)) > 1:
     parser.error('--smoke-test, --benchmark-one-epoch, and --pilot-training are mutually exclusive')
+if args.eval_final_only and not args.pilot_training:
+    parser.error('--eval-final-only requires --pilot-training or --resume-pilot')
 if args.epochs <= 0:
     parser.error('--epochs must be positive')
 if args.batch_size <= 0:
@@ -862,15 +870,42 @@ if __name__ == '__main__':
     elif args.pilot_training:
         lambda_loss = args.lambda_loss
         pilot_history = []
-        pilot_total_start = time.perf_counter()
         pilot_checkpoint = './saved_model/pilot/latest.pt'
+        pilot_start_epoch = steps_epoch
 
-        for epoch in range(steps_epoch, config.tot_epoch):
+        if args.resume_pilot:
+            resume_checkpoint = torch.load(args.resume_pilot, map_location='cpu', weights_only=True)
+            if 'model_state_dict' not in resume_checkpoint or 'epoch' not in resume_checkpoint:
+                raise RuntimeError('Pilot resume checkpoint must contain model_state_dict and epoch.')
+            net.load_state_dict(resume_checkpoint['model_state_dict'], strict=True)
+            pilot_start_epoch = int(resume_checkpoint['epoch'])
+            pilot_history = list(resume_checkpoint.get('pilot_history', []))
+            global_step = pilot_start_epoch * len(train_loader)
+            print('[Pilot Resume] checkpoint:', args.resume_pilot, flush=True)
+            print('[Pilot Resume] codec model_state_dict loaded with strict=True', flush=True)
+            print('[Pilot Resume] checkpoint epoch={} | next internal epoch={} | next displayed epoch={}'.format(
+                pilot_start_epoch, pilot_start_epoch, pilot_start_epoch + 1), flush=True)
+            print('[Pilot Resume] optimizer_state_dict intentionally not loaded; Adam is recreated each epoch.', flush=True)
+            if 'classifier_state_dict' not in resume_checkpoint:
+                classifier_warning = (
+                    'Epoch 10 checkpoint has no classifier_state_dict. The classifier is initialized from '
+                    'google_net.pkl; BatchNorm running statistics changed during Epochs 1-10 cannot be restored.'
+                )
+                print('[Pilot Resume Warning]', classifier_warning, flush=True)
+                logger.warning(classifier_warning)
+            del resume_checkpoint
+
+        if pilot_start_epoch >= config.tot_epoch:
+            raise RuntimeError('Resume epoch {} must be less than --epochs {}.'.format(
+                pilot_start_epoch, config.tot_epoch))
+
+        pilot_total_start = time.perf_counter()
+
+        for epoch in range(pilot_start_epoch, config.tot_epoch):
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
-            pilot_epoch_start = time.perf_counter()
 
             if epoch < 200:
                 cur_lr = 0.01
@@ -891,6 +926,7 @@ if __name__ == '__main__':
                 cur_lr = 0.0001
                 optimizer = optim.Adam(model_params, lr=cur_lr)
 
+            pilot_train_start = time.perf_counter()
             try:
                 lambda_loss, train_stats = train_one_epoch(args, lambda_loss, H_fading_all)
             except torch.cuda.OutOfMemoryError:
@@ -902,21 +938,34 @@ if __name__ == '__main__':
             if train_stats['has_nan'] or train_stats['has_inf']:
                 print('Pilot stopped: NaN/Inf detected in training at epoch {}.'.format(epoch + 1))
                 raise SystemExit(1)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            train_runtime = time.perf_counter() - pilot_train_start
 
-            try:
-                test_stats = test(H_fading_all)
-            except torch.cuda.OutOfMemoryError:
-                peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-                peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-                print('Pilot stopped: CUDA OOM during evaluation at epoch {} | peak allocated {:.2f} MiB | peak reserved {:.2f} MiB'.format(
-                    epoch + 1, peak_allocated, peak_reserved))
-                raise SystemExit(1)
-            test_psnr = float(test_stats['psnr'][0])
-            test_msssim = float(test_stats['msssim'][0])
-            test_accuracy = float(test_stats['accuracy'][0])
-            if not all(math.isfinite(value) for value in (test_psnr, test_msssim, test_accuracy)):
-                print('Pilot stopped: NaN/Inf detected in evaluation at epoch {}.'.format(epoch + 1))
-                raise SystemExit(1)
+            should_evaluate = (not args.eval_final_only) or (epoch + 1 == config.tot_epoch)
+            test_psnr = None
+            test_msssim = None
+            test_accuracy = None
+            evaluation_runtime = 0.0
+            if should_evaluate:
+                pilot_evaluation_start = time.perf_counter()
+                try:
+                    test_stats = test(H_fading_all)
+                except torch.cuda.OutOfMemoryError:
+                    peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                    peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+                    print('Pilot stopped: CUDA OOM during evaluation at epoch {} | peak allocated {:.2f} MiB | peak reserved {:.2f} MiB'.format(
+                        epoch + 1, peak_allocated, peak_reserved))
+                    raise SystemExit(1)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                evaluation_runtime = time.perf_counter() - pilot_evaluation_start
+                test_psnr = float(test_stats['psnr'][0])
+                test_msssim = float(test_stats['msssim'][0])
+                test_accuracy = float(test_stats['accuracy'][0])
+                if not all(math.isfinite(value) for value in (test_psnr, test_msssim, test_accuracy)):
+                    print('Pilot stopped: NaN/Inf detected in evaluation at epoch {}.'.format(epoch + 1))
+                    raise SystemExit(1)
 
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
@@ -925,7 +974,7 @@ if __name__ == '__main__':
             else:
                 peak_allocated = 0.0
                 peak_reserved = 0.0
-            epoch_runtime = time.perf_counter() - pilot_epoch_start
+            epoch_runtime = train_runtime + evaluation_runtime
 
             epoch_result = {
                 'epoch': epoch + 1,
@@ -936,6 +985,8 @@ if __name__ == '__main__':
                 'test_psnr': test_psnr,
                 'test_msssim': test_msssim,
                 'test_accuracy': test_accuracy,
+                'train_runtime_seconds': train_runtime,
+                'evaluation_runtime_seconds': evaluation_runtime,
                 'epoch_runtime_seconds': epoch_runtime,
                 'peak_allocated_mib': peak_allocated,
                 'peak_reserved_mib': peak_reserved,
@@ -950,32 +1001,47 @@ if __name__ == '__main__':
                 'epoch': epoch + 1,
                 'model_state_dict': net.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'classifier_state_dict': classifier.state_dict(),
                 'pilot_history': pilot_history,
                 'configuration': vars(args),
             }
-            torch.save(checkpoint, pilot_checkpoint)
+            save_intermediate = not (args.resume_pilot and args.eval_final_only)
+            if save_intermediate or epoch + 1 == config.tot_epoch:
+                torch.save(checkpoint, pilot_checkpoint)
             if epoch + 1 == config.tot_epoch:
                 torch.save(checkpoint, './saved_model/pilot/epoch_{:03d}.pt'.format(epoch + 1))
 
-            print('[Pilot Epoch] epoch={} lr={} train_distortion={:.9f} train_proposed={:.9f} train_total={:.9f} test_psnr={:.9f} test_msssim={:.9f} test_accuracy={:.6f} runtime_seconds={:.3f} peak_allocated_mib={:.2f} peak_reserved_mib={:.2f}'.format(
+            test_psnr_text = 'N/A' if test_psnr is None else '{:.9f}'.format(test_psnr)
+            test_msssim_text = 'N/A' if test_msssim is None else '{:.9f}'.format(test_msssim)
+            test_accuracy_text = 'N/A' if test_accuracy is None else '{:.6f}'.format(test_accuracy)
+            print('[Pilot Epoch] epoch={} lr={} train_distortion={:.9f} train_proposed={:.9f} train_total={:.9f} test_psnr={} test_msssim={} test_accuracy={} train_runtime_seconds={:.3f} evaluation_runtime_seconds={:.3f} peak_allocated_mib={:.2f} peak_reserved_mib={:.2f}'.format(
                 epoch + 1, cur_lr, train_stats['mean_distortion_loss'],
                 train_stats['mean_proposed_loss'], train_stats['mean_total_loss'],
-                test_psnr, test_msssim, test_accuracy, epoch_runtime,
+                test_psnr_text, test_msssim_text, test_accuracy_text,
+                train_runtime, evaluation_runtime,
                 peak_allocated, peak_reserved), flush=True)
 
         pilot_total_runtime = time.perf_counter() - pilot_total_start
         print('[Pilot Training Result]')
         print('Epoch | Train Loss | PSNR | MS-SSIM | Accuracy')
         for result in pilot_history:
-            print('{} | {:.9f} | {:.9f} | {:.9f} | {:.6f}'.format(
-                result['epoch'], result['train_total_loss'], result['test_psnr'],
-                result['test_msssim'], result['test_accuracy']))
-        print('best_psnr:', max(result['test_psnr'] for result in pilot_history))
-        print('best_msssim:', max(result['test_msssim'] for result in pilot_history))
-        print('best_accuracy:', max(result['test_accuracy'] for result in pilot_history))
+            print('{} | {:.9f} | {} | {} | {}'.format(
+                result['epoch'], result['train_total_loss'],
+                'N/A' if result['test_psnr'] is None else '{:.9f}'.format(result['test_psnr']),
+                'N/A' if result['test_msssim'] is None else '{:.9f}'.format(result['test_msssim']),
+                'N/A' if result['test_accuracy'] is None else '{:.6f}'.format(result['test_accuracy'])))
+        evaluated_results = [result for result in pilot_history if result['test_psnr'] is not None]
+        print('best_psnr:', max(result['test_psnr'] for result in evaluated_results))
+        print('best_msssim:', max(result['test_msssim'] for result in evaluated_results))
+        print('best_accuracy:', max(result['test_accuracy'] for result in evaluated_results))
+        resumed_results = [result for result in pilot_history if result['epoch'] > pilot_start_epoch]
+        print('active_training_runtime_seconds: {:.3f}'.format(
+            sum(result.get('train_runtime_seconds', 0.0) for result in resumed_results)))
+        print('evaluation_runtime_seconds: {:.3f}'.format(
+            sum(result.get('evaluation_runtime_seconds', 0.0) for result in resumed_results)))
         print('total_runtime_seconds: {:.3f}'.format(pilot_total_runtime))
-        print('peak_allocated_mib:', max(result['peak_allocated_mib'] for result in pilot_history))
-        print('peak_reserved_mib:', max(result['peak_reserved_mib'] for result in pilot_history))
+        print('peak_allocated_mib:', max(result['peak_allocated_mib'] for result in resumed_results))
+        print('peak_reserved_mib:', max(result['peak_reserved_mib'] for result in resumed_results))
         print('latest_checkpoint:', pilot_checkpoint)
         print('final_checkpoint: ./saved_model/pilot/epoch_{:03d}.pt'.format(config.tot_epoch))
     elif args.training:

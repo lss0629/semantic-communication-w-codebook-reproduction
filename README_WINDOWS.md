@@ -81,3 +81,16 @@ After all construction epochs complete, the script saves the final in-memory cod
 more to the same `results_data/SC_size{SCsize}.npy` path. This final-output correctness fix prevents
 the last nine update epochs from being absent from the output file; it does not change codeword
 distance, assignment, update, preprocessing, or iteration-count logic.
+
+## Pilot resume correctness note
+
+The Phase 7C pilot resume path loads only the codec `model_state_dict` with `strict=True`. It does
+not restore `optimizer_state_dict`, because the original training loop intentionally creates a new
+Adam optimizer at the beginning of every epoch. RNG and DataLoader state are also not restored.
+
+The Epoch 10 pilot checkpoint predates classifier checkpointing and therefore has no
+`classifier_state_dict`. On an Epoch 10 resume, the classifier is initialized from
+`google_net.pkl`; any BatchNorm running-statistic changes made during Epochs 1-10 cannot be
+recovered. This limitation is reported in the resume log. Starting with the Epoch 15 checkpoint,
+pilot checkpoints include `classifier_state_dict` for more complete future resume metadata. Adding
+this saved state does not change classifier or codec training behavior.
